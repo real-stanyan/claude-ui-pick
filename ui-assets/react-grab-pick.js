@@ -278,14 +278,37 @@
     if (!picked && e.target && e.target.nodeType === 1 && e.target !== hl && e.target !== sel) place(hl, e.target);
   };
 
-  // remove the interaction listeners (called on pick AND on full teardown)
+  // remove ALL interaction listeners (hover/pick AND the after-pick outside-click watcher)
   var stopListening = function () {
     try { document.removeEventListener("mousemove", onMove, true); } catch (e) {}
     try { document.removeEventListener("click", onClick, true); } catch (e) {}
+    try { document.removeEventListener("click", onOutsideClick, true); } catch (e) {}
   };
+
+  // after a pick, a click on ANY OTHER area (not the selected element, not the
+  // widget, not the lock box) CANCELS the selection and returns to armed/hover —
+  // so the user can deselect by clicking away.
+  var lockedEl = null;
+  var onOutsideClick = function (e) {
+    var t = e.target;
+    if (!t || t.nodeType !== 1) return;
+    if (widgetEl && widgetEl.contains(t)) return;          // widget controls: never deselect
+    if (t === sel || t === selLabel || (sel && sel.contains(t))) return; // the lock box itself
+    if (t === lockedEl) return;                            // re-click the SAME element: keep it
+    e.preventDefault(); e.stopImmediatePropagation();      // swallow the deselecting click
+    deselectToArmed();
+  };
+  // clear the current selection and go back to armed (hover + pick live again)
+  var deselectToArmed = function () {
+    lockedEl = null;
+    try { document.removeEventListener("click", onOutsideClick, true); } catch (e) {}
+    try { window.__UI_PICK_REARM__ && window.__UI_PICK_REARM__(); } catch (e) {} // null pick, hide lock, widget→armed, re-add hover/pick
+  };
+
   // PICK: lock the selected box onto the chosen element, keep it visible while editing
   var lockSelection = function (el) {
     stopListening();
+    lockedEl = el;                                         // remember the selected element for outside-click deselect
     try { resetProcVisual(); } catch (e) {}   // M1: never inherit a prior block's processing visuals
     try { hl.style.display = "none"; } catch (e) {}
     place(sel, el);
@@ -295,9 +318,11 @@
       selLabel.textContent = (tag ? "<" + tag + ">" : "selected") + (t ? "  " + t.slice(0, 40) : "");
       lastTag = (tag || "node").replace(/[^a-z0-9-]/g, "") || "node";   // S3: sanitize; remembered for __UI_PICK_PROCESSING__
     } catch (e) {}
-    // reflect the pick in the status widget (listeners are now off; toggle stays ON
-    // so the user can "select another" by re-arming via the switch)
+    // reflect the pick in the status widget (toggle stays ON so the user can re-pick)
     try { setWidgetState("picked", (el.tagName || "").toLowerCase()); } catch (e) {}
+    // watch for a click OUTSIDE the selected element → cancel selection (deferred so
+    // THIS pick's own click doesn't immediately deselect)
+    setTimeout(function () { try { document.addEventListener("click", onOutsideClick, true); } catch (e) {} }, 0);
   };
   // FULL teardown (Esc / Step 9 disarm / re-arm): remove listeners AND hide BOTH boxes
   var teardown = function () {
@@ -320,7 +345,8 @@
   document.addEventListener("mousemove", onMove, true);
   document.addEventListener("click", onClick, true);
   window.__UI_PICK_REARM__ = function () {              // re-arm on re-install of /ui
-    picked = false; window.__UI_PICK__ = null;
+    picked = false; window.__UI_PICK__ = null; lockedEl = null;
+    try { document.removeEventListener("click", onOutsideClick, true); } catch (e) {}  // drop the deselect watcher
     try { resetProcVisual(); } catch (e) {}             // M1: don't carry processing visuals/timers into the next pick
     try { sel.style.display = "none"; } catch (e) {}    // clear the previous selection lock
     document.addEventListener("mousemove", onMove, true);
