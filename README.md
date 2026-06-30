@@ -68,7 +68,11 @@ To also wire the opt-in selection-banner statusline:
 The statusline path is the only thing that touches `settings.json`. When you opt in,
 the installer backs up `settings.json` first (timestamped), **preserves** your
 existing statusline by chaining it, and prints an exact rollback command. It refuses
-to wire anything if it can't write a backup.
+to wire anything if it can't write a backup. It also sets `"refreshInterval": 1` —
+Claude Code only re-runs the statusline on events (new message, etc.) and goes static
+while idle, so the 1s timer is **required** for the banner to track your selection live
+while you click in the browser. (If you wire the statusline by hand, add `refreshInterval`
+yourself.) Changes to `settings.json` may need a Claude Code restart to take effect.
 
 ### Option B — Claude Code plugin
 

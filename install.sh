@@ -94,7 +94,10 @@ if prev_cmd and os.path.abspath(prev_cmd) != os.path.abspath(wrapper) and not os
         f.write("#!/bin/bash\n# preserved by claude-ui-pick installer on %s\nexec %s \"$@\"\n" %
                 (__import__("time").strftime("%Y-%m-%d %H:%M:%S"), prev_cmd))
     os.chmod(orig_shim, os.stat(orig_shim).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-cfg["statusLine"] = {"type": "command", "command": wrapper}
+# refreshInterval:1 re-runs the statusline every 1s in addition to event triggers — REQUIRED
+# so the /ui selection banner tracks the live marker while the session is idle (clicking in
+# the browser doesn't fire a Claude Code event). Documented use case for externally-sourced state.
+cfg["statusLine"] = {"type": "command", "command": wrapper, "refreshInterval": 1}
 json.dump(cfg, open(settings, "w"), indent=2)
 print("[ui-pick] statusLine -> %s" % wrapper)
 print("[ui-pick] preserved prior statusline as shim: %s" % (prev_cmd or "(none)"))
