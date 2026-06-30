@@ -44,7 +44,8 @@ install_file "$HERE/ui-assets/react-grab-pick.js"       "$ASSETS_DIR/react-grab-
 install_file "$HERE/ui-assets/react-grab-pick.min.js"   "$ASSETS_DIR/react-grab-pick.min.js"
 install_file "$HERE/ui-assets/detect-dev-url.sh"        "$ASSETS_DIR/detect-dev-url.sh"
 install_file "$HERE/ui-assets/spike-react-grab.sh"      "$ASSETS_DIR/spike-react-grab.sh"
-chmod +x "$ASSETS_DIR/detect-dev-url.sh" "$ASSETS_DIR/spike-react-grab.sh"
+install_file "$HERE/ui-assets/ui-selection-watch.sh"    "$ASSETS_DIR/ui-selection-watch.sh"
+chmod +x "$ASSETS_DIR/detect-dev-url.sh" "$ASSETS_DIR/spike-react-grab.sh" "$ASSETS_DIR/ui-selection-watch.sh"
 say "installed /ui command + assets into $CMD_DIR"
 
 # sanity: the minified payload must parse
