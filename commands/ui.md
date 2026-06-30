@@ -1,6 +1,6 @@
 ---
 description: Click a component in your running localhost and edit its source (cmux OR plain Chrome)
-argument-hint: "[chrome|cmux] [optional one-shot instruction, e.g. make this button rounded]"
+argument-hint: "[chrome|cmux] [http://localhost:PORT] [optional instruction, e.g. make this button rounded]"
 allowed-tools: Bash(/Applications/cmux.app/Contents/Resources/bin/cmux:*), Bash(bash:*), Bash(node:*), Bash(curl:*), Bash(test:*), Bash(grep:*), Bash(rg:*), Bash(cat:*), Read, Edit, Glob, Grep, mcp__chrome-devtools__new_page, mcp__chrome-devtools__list_pages, mcp__chrome-devtools__select_page, mcp__chrome-devtools__evaluate_script, mcp__chrome-devtools__navigate_page, mcp__chrome-devtools__take_screenshot
 ---
 
@@ -15,10 +15,13 @@ order with real transport calls. Be deterministic. Never silently edit a file yo
 - **chrome** — drives plain Chrome via the **chrome-devtools MCP**, for Claude Code
   users in any terminal (no cmux). Same capture script, same blob, same edit logic.
 
-`$ARGUMENTS` parsing: if the **first whitespace token** is `chrome` or `cmux`, it
-**forces the driver** and is consumed; the REST is the one-shot instruction. Otherwise
-the whole of `$ARGUMENTS` is the instruction and the driver is auto-detected. Empty
-instruction → **select-then-instruct**: capture the pick, then ask Stan what to change.
+`$ARGUMENTS` parsing (in order, each token optional): **[driver] [target-url] [instruction]**
+- a leading `chrome` or `cmux` token **forces the driver** (consumed);
+- then a **URL-ish token** (`http://…`, `https://…`, `localhost:PORT`, `127.0.0.1:PORT`, or
+  bare `:PORT`) sets the **target localhost URL** to open (consumed) — this OVERRIDES dev-URL
+  auto-detection (Step 1). e.g. `/ui http://localhost:5173`, `/ui chrome :3000 make it dark`;
+- whatever REMAINS is the one-shot instruction.
+- Empty instruction → **select-then-instruct**: capture the pick, then ask Stan what to change.
 
 Constants:
 ```bash
@@ -64,15 +67,29 @@ source resolution, edit discipline) is **shared and identical** across drivers. 
 | 5 | none of the above | **STOP** — print install guidance (below) |
 
 ```bash
-# tokenize $ARGUMENTS → DRIVER + INSTRUCTION
-# glob-safe: do NOT use `set -- $ARGUMENTS` — under a normal user shell it word-splits
-# AND pathname-expands the instruction (e.g. `/ui chrome make the * bigger` expands `*`
-# to filenames, then that corrupted text drives the edit). Use param expansion instead.
-first="${ARGUMENTS%%[[:space:]]*}"
-case "$first" in
-  chrome|cmux) DRIVER="$first"; INSTRUCTION="${ARGUMENTS#"$first"}"; INSTRUCTION="${INSTRUCTION#"${INSTRUCTION%%[![:space:]]*}"}";;
-  *) DRIVER=""; INSTRUCTION="$ARGUMENTS";;
+# tokenize $ARGUMENTS → DRIVER + TARGET_URL + INSTRUCTION  (each token optional, in order)
+# glob-safe: do NOT use `set -- $ARGUMENTS` — under a normal user shell it word-splits AND
+# pathname-expands the instruction (e.g. `/ui make the * bigger` expands `*`). Use param expansion.
+DRIVER=""; TARGET_URL=""
+REST="$ARGUMENTS"; REST="${REST#"${REST%%[![:space:]]*}"}"     # ltrim
+tok="${REST%%[[:space:]]*}"
+# 1) optional driver token
+case "$tok" in
+  chrome|cmux) DRIVER="$tok"; REST="${REST#"$tok"}"; REST="${REST#"${REST%%[![:space:]]*}"}"; tok="${REST%%[[:space:]]*}";;
 esac
+# 2) optional target-URL token (OVERRIDES dev-URL detection in Step 1)
+case "$tok" in
+  http://*|https://*|localhost:[0-9]*|127.0.0.1:[0-9]*|:[0-9]*)
+    TARGET_URL="$tok"; REST="${REST#"$tok"}"; REST="${REST#"${REST%%[![:space:]]*}"}"
+    case "$TARGET_URL" in
+      http://*|https://*) ;;                                   # already a full URL
+      :*)  TARGET_URL="http://localhost$TARGET_URL";;          # :3000 → http://localhost:3000
+      *)   TARGET_URL="http://$TARGET_URL";;                   # localhost:3000 / 127.0.0.1:3000
+    esac;;
+esac
+# 3) the remainder is the one-shot instruction
+INSTRUCTION="$REST"
+echo "DRIVER pending; TARGET_URL=${TARGET_URL:-<auto-detect>}; INSTRUCTION=${INSTRUCTION:-<select-then-instruct>}"
 [ -z "$DRIVER" ] && [ -n "${UI_DRIVER:-}" ] && DRIVER="$UI_DRIVER"
 if [ -z "$DRIVER" ]; then
   if [ -x "$CMUX" ] && $CMUX rpc surface.current '{}' >/dev/null 2>&1; then DRIVER=cmux; fi
@@ -150,16 +167,27 @@ else echo "no package.json in session cwd ($PWD) — ASK Stan for the project ro
 
 Reuse an existing localhost view if there is one; else open the dev URL.
 
+**Resolve the URL to open ONCE** — an explicit `TARGET_URL` (from `/ui http://localhost:PORT`,
+Step T) wins over auto-detection; only probe when the user didn't name a URL:
+```bash
+if [ -n "$TARGET_URL" ]; then DEV_URL="$TARGET_URL"            # user named it explicitly
+else DEV_URL="$(bash "$ASSETS/detect-dev-url.sh" "$PROJECT_ROOT")"; fi   # exits 2 if nothing listening
+echo "DEV_URL=$DEV_URL"
+```
+When a `TARGET_URL` was given, **prefer reusing an already-open tab/surface on that exact URL**;
+also relax the reuse match below from "any localhost" to "this URL".
+
 ### Branch DRIVER=cmux
 Prefer **reusing** an existing browser surface already showing localhost:
 ```bash
 $CMUX rpc surface.list '{}'             # look for entries with type != "terminal"
 $CMUX browser --surface <ref> get url   # reuse if it points at localhost
 ```
-If none, detect the dev URL and open one. **`--json` is NOT supported on `cmux open`**, so
-capture the new surface ref by **diffing `surface.list` before/after the open**:
+If none, open `$DEV_URL` (resolved above — `TARGET_URL` or auto-detected). **`--json` is NOT
+supported on `cmux open`**, so capture the new surface ref by **diffing `surface.list`
+before/after the open**:
 ```bash
-DEV_URL="$(bash "$ASSETS/detect-dev-url.sh" "$PROJECT_ROOT")"; echo "$DEV_URL"
+# $DEV_URL already set in the Step 1 preamble (TARGET_URL wins; else detect-dev-url.sh)
 BEFORE="$($CMUX rpc surface.list '{}')"
 $CMUX open "$DEV_URL" --workspace <workspace_id>          # focused, so Step 5 can click; no --json
 sleep 1
@@ -170,14 +198,13 @@ If `detect-dev-url.sh` exits 2 (nothing listening), tell Stan the inferred URL a
 to start his dev server, then re-run. Bind `S=<surface-ref>` for all later op calls.
 
 ### Branch DRIVER=chrome
-Reuse a localhost tab if one is open; else open it:
-```bash
-DEV_URL="$(bash "$ASSETS/detect-dev-url.sh" "$PROJECT_ROOT")"; echo "$DEV_URL"
-```
-- `list_pages` → if a page's URL is localhost (the dev app), `select_page` it.
-- else `new_page({url:"<DEV_URL>"})` (opens foregrounded — solves Step 5's "make it visible").
-- If `detect-dev-url.sh` exits 2, tell Stan the inferred URL and ask him to start the dev
-  server, then re-run. There is no surface ref on chrome — the **selected page** IS the target.
+Reuse a tab on `$DEV_URL` (resolved above) if one is open; else open it:
+- `list_pages` → if a page's URL matches `$DEV_URL` (or any localhost when auto-detected),
+  `select_page` it.
+- else `new_page({url:"$DEV_URL"})` (opens foregrounded — solves Step 5's "make it visible").
+- If `$DEV_URL` came from `detect-dev-url.sh` exit 2 (nothing listening), tell Stan the inferred
+  URL and ask him to start the dev server, then re-run. There is no surface ref on chrome — the
+  **selected page** IS the target.
 
 ## Step 2 — (Optional, cmux only) spike: is the project source-instrumented?
 
