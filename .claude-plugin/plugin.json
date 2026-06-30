@@ -1,0 +1,16 @@
+{
+  "name": "claude-ui-pick",
+  "version": "0.1.0",
+  "description": "Click a component in your running localhost browser and edit its source. Works over cmux OR plain Chrome via the chrome-devtools MCP.",
+  "author": {
+    "name": "Stan"
+  },
+  "keywords": [
+    "ui",
+    "react",
+    "devtools",
+    "cmux",
+    "chrome-devtools",
+    "slash-command"
+  ]
+}

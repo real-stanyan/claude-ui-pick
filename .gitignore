@@ -1,0 +1,5 @@
+.DS_Store
+.ui-pick/
+ui-pick-last.png
+ui-after.png
+*.log
