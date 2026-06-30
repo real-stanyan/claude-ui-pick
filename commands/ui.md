@@ -242,6 +242,16 @@ Parse the returned JSON: `mode` is `self-overlay`; `hasGetSource` tells you whet
 expect a trusted line or the content-locate path. `reactGrabPresent:false` is fine —
 `_debugSource` does not depend on react-grab (VERIFIED live in plain Chrome).
 
+**(cmux only) Start the live selection watcher** so the terminal statusline tracks the
+in-page selection in real time (banner appears on pick, clears on deselect, updates on
+re-pick) — without it the marker only updates at poll checkpoints and lags behind clicks:
+```bash
+touch ~/.claude/.ui-watch.stop 2>/dev/null; sleep 0.6; rm -f ~/.claude/.ui-watch.stop   # stop any prior watcher
+nohup bash "$ASSETS/ui-selection-watch.sh" "$S" >/dev/null 2>&1 &                        # background bridge
+```
+(chrome can't run this — `__UI_PICK__` is read via an MCP tool, not bash — so on chrome the
+marker is written at the Step 6 / Step 8 checkpoints only.)
+
 ## Step 5 — make the browser visible, tell Stan to click
 
 The capture overlay is already live. Make sure the view is foregrounded so Stan can click.
@@ -416,6 +426,7 @@ Tear down the capture script's overlay + listeners (teardown op):
 ```bash
 # cmux:   $CMUX browser --surface "$S" eval --script 'window.__UI_PICK_TEARDOWN__&&window.__UI_PICK_TEARDOWN__()'
 # chrome: evaluate_script({function:"() => { window.__UI_PICK_TEARDOWN__&&window.__UI_PICK_TEARDOWN__(); return true; }"})
+touch ~/.claude/.ui-watch.stop                # stop the live selection watcher (cmux)
 rm -f ~/.claude/ui-selection.json             # clear the statusline banner
 rm -rf "$SCRATCH"                             # clean runtime artifacts
 [ "$DRIVER" = chrome ] && rm -rf "$PROJECT_ROOT/.ui-pick"   # chrome screenshot artifacts (S3)
