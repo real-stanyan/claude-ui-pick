@@ -23,7 +23,7 @@ if [ -f "$MARKER" ]; then
 import json, sys, time
 try:
     m = json.load(open(sys.argv[1]))
-    if time.time() - float(m.get("ts", 0)) > 3600:   # stale -> show nothing
+    if time.time() - float(m.get("ts", 0)) > 180:   # idle >3min -> auto-hide
         sys.exit(0)
     state = m.get("state", "selected")
     tag = str(m.get("tag", "?"))[:16]
