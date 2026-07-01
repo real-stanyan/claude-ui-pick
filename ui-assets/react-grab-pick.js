@@ -22,12 +22,16 @@
   // ---- idempotent re-install (re-invoking /ui must not stack listeners) ----
   if (window.__UI_PICK_INSTALLED__) {
     window.__UI_PICK__ = null; // arm a fresh capture
+    // E6: a live preview must NOT survive a reinstall — restore overrides + drop the panel first.
+    try { window.__UI_PICK_PREVIEW_END__ && window.__UI_PICK_PREVIEW_END__(); } catch (e) {}
+    window.__UI_PICK_DECISION__ = null;
     try { window.__UI_PICK_REARM__ && window.__UI_PICK_REARM__(); } catch (e) {}
     return JSON.stringify(Object.assign({ reinstalled: true }, window.__UI_PICK_STATUS__ || {}));
   }
 
   window.__UI_PICK__ = null;
   window.__UI_PICK_INSTALLED__ = true;
+  window.__UI_PICK_DECISION__ = null; // latched verdict: null | 'apply' | 'cancel' (runbook polls)
 
   var RG = window.__REACT_GRAB__ || null;
   var has = function (name) { return RG && typeof RG[name] === "function"; };
@@ -265,6 +269,18 @@
   var lastTag = null;            // tag of the currently locked selection (drives the processing/done states)
   var procTimers = [];           // pending done/revert timers, cleared on re-entry so calls don't stack
 
+  // ---- preview / verdict state (the "previewing" machine; assigned by the preview block below) ----
+  var previewing = false;        // true while a live preview overlay is mounted on the locked element
+  var previewSpec = null;        // the spec object currently being previewed
+  var previewSnapshot = null;    // [{prop,value,priority}] override props (used by COMMIT to strip them post-HMR)
+  var previewCssSnap = null;     // FULL inline cssText at preview entry — the ONLY reliable restore basis:
+                                 // overriding a longhand (background-color) expands the author's shorthand
+                                 // (background) irreversibly, so per-prop restore can't rebuild it. cssText
+                                 // restore is exact. Used by the no-HMR paths (toggle-old / Cancel / END).
+  var previewTextSnap = null;    // {node,orig} when a text swap is active, else null
+  var previewShowingNew = false; // panel toggle position: true = new override shown, false = old restored
+  var panelEl = null;            // the docked compare/verdict panel (#__ui_pick_panel__)
+
   var place = function (box, el) {
     try {
       var r = el.getBoundingClientRect();
@@ -290,6 +306,7 @@
   // so the user can deselect by clicking away.
   var lockedEl = null;
   var onOutsideClick = function (e) {
+    if (previewing) return;   // E3: preview is modal — outside-click never deselects (onClick swallows page clicks)
     var t = e.target;
     if (!t || t.nodeType !== 1) return;
     if (widgetEl && widgetEl.contains(t)) return;          // widget controls: never deselect
@@ -327,13 +344,25 @@
   // FULL teardown (Esc / Step 9 disarm / re-arm): remove listeners AND hide BOTH boxes
   var teardown = function () {
     stopListening();
+    try { if (previewing) leavePreviewing("restore"); } catch (e) {}  // restore any live preview override
+    try { removePanel(); } catch (e) {}                                // drop the verdict panel
+    window.__UI_PICK_DECISION__ = null;                                // reset latched verdict on hard exit
     try { resetProcVisual(); } catch (e) {}   // M1: kill any in-flight processing visuals + timers
     try { hl.style.display = "none"; } catch (e) {}
     try { sel.style.display = "none"; } catch (e) {}
+    try { sel.classList.remove("is-previewing"); } catch (e) {}
   };
 
   // capture-phase click: stop the app's handler, capture, then LOCK the highlight
   var onClick = function (e) {
+    // E3: while previewing, the pick is MODAL — let widget/panel controls through, swallow every other
+    // page click (don't trigger app handlers, don't re-pick). Verdict comes only from panel/Esc/widget.
+    if (previewing) {
+      if (widgetEl && e.target && widgetEl.contains(e.target)) return;  // widget switch/✕ still work
+      if (panelEl && e.target && panelEl.contains(e.target)) return;    // panel Apply/Cancel/switch still work
+      try { e.preventDefault(); e.stopImmediatePropagation(); } catch (e2) {}
+      return;
+    }
     if (widgetEl && e.target && widgetEl.contains(e.target)) return; // clicks on the switch/✕ are not picks
     if (picked || window.__UI_PICK__ === "cancelled") return;
     var el = e.target;
@@ -345,6 +374,11 @@
   document.addEventListener("mousemove", onMove, true);
   document.addEventListener("click", onClick, true);
   window.__UI_PICK_REARM__ = function () {              // re-arm on re-install of /ui
+    // E6: never carry a live preview across a re-arm — restore overrides + remove the panel FIRST
+    // (while lockedEl is still set so the restore can run), then clear the verdict.
+    try { if (previewing) window.__UI_PICK_PREVIEW_END__(); } catch (e) {}
+    try { removePanel(); } catch (e) {}
+    window.__UI_PICK_DECISION__ = null;
     picked = false; window.__UI_PICK__ = null; lockedEl = null;
     try { document.removeEventListener("click", onOutsideClick, true); } catch (e) {}  // drop the deselect watcher
     try { resetProcVisual(); } catch (e) {}             // M1: don't carry processing visuals/timers into the next pick
@@ -419,6 +453,7 @@
       if (on) {
         if (!active) return;                      // nothing selected -> no-op safely
         clearProcTimers();
+        try { sel.classList.remove("is-previewing"); } catch (e) {}  // apply machine owns the box now; drop amber preview edge
         try { selLabel.style.background = "#4f46e5"; selLabel.style.color = "#fff"; } catch (e) {} // S1: drop leftover emerald chip if (false)->(true) raced
         try { ensureSweep(); } catch (e) {}        // show the sweep band
         try { sel.classList.remove("is-done"); sel.classList.add("is-processing"); } catch (e) {}
@@ -465,6 +500,370 @@
         try { setWidgetState("picked", tag); } catch (e) {}
       }, 600));
     } catch (e) {}
+  };
+
+  // ----------------------- preview / verdict (previewing machine) -----------------------
+  // Renders a non-destructive "what would change" overlay on the locked element + a docked
+  // verdict panel (Apply / Cancel / old↔new). The runbook polls window.__UI_PICK_DECISION__
+  // (latched) to drive the Edit+HMR landing. Every DOM op is guarded; idempotent; no preview
+  // ever survives a re-arm/teardown. amber (#f59e0b) is the preview/awaiting-verdict color.
+
+  var toKebab = function (p) {                    // camelCase|kebab -> kebab (reuses the line-82 transform)
+    return String(p).replace(/[A-Z]/g, function (m) { return "-" + m.toLowerCase(); });
+  };
+  var raf = function (fn) {                       // rAF with a setTimeout fallback
+    try { if (window.requestAnimationFrame) return window.requestAnimationFrame(fn); } catch (e) {}
+    return setTimeout(fn, 16);
+  };
+  var rectOf = function (el) {
+    try { var r = el.getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height), l: Math.round(r.left), t: Math.round(r.top) }; }
+    catch (e) { return null; }
+  };
+  var geomDiff = function (a, b) { if (!a || !b) return false; return a.w !== b.w || a.h !== b.h || a.l !== b.l || a.t !== b.t; };
+
+  // reposition the lock box AFTER the override-driven reflow has happened (E8)
+  var rePlaceSel = function () {
+    try { if (lockedEl && lockedEl.isConnected) raf(function () { try { place(sel, lockedEl); } catch (e) {} }); } catch (e) {}
+  };
+
+  // snapshot current inline values (value + priority) for the props we're about to override
+  var snapshotInline = function (el, props) {
+    var snap = [];
+    try {
+      var st = el.style;
+      for (var i = 0; i < props.length; i++) {
+        var prop = props[i], val = "", pri = "";
+        try { val = st.getPropertyValue(prop); } catch (e) {}
+        try { pri = st.getPropertyPriority(prop); } catch (e) {}
+        snap.push({ prop: prop, value: val, priority: pri });
+      }
+    } catch (e) {}
+    return snap;
+  };
+  // apply spec.styles as !important inline overrides (E9: preview must beat author !important)
+  var applyOverride = function (el, styles) {
+    var applied = [];
+    try {
+      for (var prop in styles) {
+        if (!styles.hasOwnProperty(prop)) continue;
+        var kp = toKebab(prop);
+        try { el.style.setProperty(kp, String(styles[prop]), "important"); applied.push(kp); } catch (e) {}
+      }
+    } catch (e) {}
+    return applied;
+  };
+  // restore the snapshotted inline values (re-applies original value + priority; removes ours when empty)
+  var restoreOverride = function (el, snap) {
+    if (!el || !snap) return;
+    try {
+      for (var i = 0; i < snap.length; i++) {
+        var s = snap[i];
+        try { el.style.removeProperty(s.prop); } catch (e) {}
+        if (s.value) { try { el.style.setProperty(s.prop, s.value, s.priority || ""); } catch (e) {} }
+      }
+    } catch (e) {}
+  };
+  // text swap (kind:"text") — only when the element has NO element children (don't clobber structure)
+  var applyTextSwap = function (el, to) {
+    try {
+      var kids = el.childNodes || [];
+      for (var i = 0; i < kids.length; i++) { if (kids[i].nodeType === 1) return null; }
+      var orig = el.textContent;
+      el.textContent = String(to);
+      return { node: el, orig: orig };
+    } catch (e) { return null; }
+  };
+
+  // old/new toggling — uses the live snapshot/spec, leaves both intact so it can flip repeatedly
+  var showOld = function () {
+    // restore the EXACT original inline declaration (cssText), not per-prop: setting a longhand override
+    // expands the author's shorthand irreversibly, so only a full-cssText restore is faithful. These paths
+    // (toggle-old / Cancel / END / FAIL) have no HMR to repaint, so the restore must be pixel-exact itself.
+    try { if (lockedEl && previewCssSnap != null) lockedEl.style.cssText = previewCssSnap; } catch (e) {}
+    try { if (previewTextSnap && previewTextSnap.node) previewTextSnap.node.textContent = previewTextSnap.orig; } catch (e) {}
+  };
+  var showNew = function () {
+    try { if (previewSpec && previewSpec.styles && lockedEl) applyOverride(lockedEl, previewSpec.styles); } catch (e) {}
+    try { if (previewTextSnap && previewTextSnap.node && previewSpec && previewSpec.textPreview) previewTextSnap.node.textContent = String(previewSpec.textPreview.to); } catch (e) {}
+  };
+  // COMMIT path: strip OUR inline override so the (now-edited) source becomes the truth.
+  // CRITICAL: only remove a prop that STILL carries our `!important`. On an inline-style app
+  // (React style={{…}}), HMR re-renders and re-sets the SAME props at NORMAL priority — which
+  // CLEARS our important flag and makes the framework the legitimate owner of that inline value.
+  // Blindly removeProperty-ing it then deletes the framework's freshly-rendered value and the
+  // element renders bare (VERIFIED: a card lost all radius/padding/shadow on commit). Props that
+  // KEPT `!important` are ours alone (class-based apps like Tailwind never set them inline) and
+  // MUST be stripped so the edited class/source takes over. So: strip iff still-important.
+  var commitDropOverride = function () {
+    try {
+      if (previewSnapshot && lockedEl) {
+        for (var i = 0; i < previewSnapshot.length; i++) {
+          var cp = previewSnapshot[i].prop;
+          try { if (lockedEl.style.getPropertyPriority(cp) === "important") lockedEl.style.removeProperty(cp); } catch (e) {}
+        }
+      }
+    } catch (e) {}
+  };
+
+  // exit the previewing visual state. mode "restore" (END/FAIL) undoes the override back to original;
+  // mode "commit" (COMMIT) strips the override so the source takes over.
+  var leavePreviewing = function (mode) {
+    try { if (mode === "commit") commitDropOverride(); else showOld(); } catch (e) {}
+    previewing = false;
+    previewSpec = null;
+    previewSnapshot = null;
+    previewCssSnap = null;
+    previewTextSnap = null;
+    previewShowingNew = false;
+    try { sel.classList.remove("is-previewing"); } catch (e) {}
+    try { if (widgetEl) widgetEl.classList.remove("wpv-old"); } catch (e) {}
+  };
+
+  // brief red flash on apply failure (widget + lock label) — NOT the emerald success flash
+  var flashError = function (msg) {
+    try {
+      if (widgetEl) { widgetEl.classList.add("is-error"); setTimeout(function () { try { widgetEl.classList.remove("is-error"); } catch (e) {} }, 900); }
+    } catch (e) {}
+    try {
+      selLabel.style.background = "#ef4444"; selLabel.style.color = "#fff";
+      selLabel.textContent = "✕ " + (msg ? String(msg).slice(0, 38) : "apply failed");
+      setTimeout(function () {
+        try {
+          selLabel.style.background = "#4f46e5"; selLabel.style.color = "#fff";
+          selLabel.textContent = "<" + (lastTag || "node") + "> selected";
+        } catch (e) {}
+      }, 900);
+    } catch (e) {}
+  };
+
+  // ---- verdict panel (single docked node, built once, reused, removed on COMMIT/END/teardown) ----
+  var onPanelToggle = function () { try { window.__UI_PICK_PREVIEW_TOGGLE__(!previewShowingNew); } catch (e) {} };
+  var onPanelApply = function () {
+    try {
+      if (previewing && !previewShowingNew) { showNew(); previewShowingNew = true; rePlaceSel(); } // Apply must land NEW
+      window.__UI_PICK_DECISION__ = "apply";   // latched; keep the override in place for the runbook
+      setPanelApplying();
+    } catch (e) {}
+  };
+  var onPanelCancel = function () {
+    try { window.__UI_PICK_PREVIEW_END__(); window.__UI_PICK_DECISION__ = "cancel"; } catch (e) {}
+  };
+  var removePanel = function () {
+    try { var p = document.getElementById("__ui_pick_panel__"); if (p && p.parentNode) p.parentNode.removeChild(p); } catch (e) {}
+    panelEl = null;
+  };
+  var buildPanelShell = function () {
+    var p = document.getElementById("__ui_pick_panel__");
+    if (p) { panelEl = p; return p; }
+    p = document.createElement("div");
+    p.id = "__ui_pick_panel__";
+    p.setAttribute("role", "dialog");
+    p.setAttribute("aria-label", "Preview changes — apply or cancel");
+    p.innerHTML =
+      '<div class="uipick-panel-summary"></div>' +
+      '<pre class="uipick-panel-diff" hidden></pre>' +
+      '<div class="uipick-panel-row">' +
+        '<span class="uipick-panel-swlabel">old</span>' +
+        '<button type="button" id="__ui_pick_panel_switch__" class="uisw-switch is-on" role="switch" aria-checked="true" aria-label="Toggle old vs new preview"><span class="uisw-knob"></span></button>' +
+        '<span class="uipick-panel-swlabel">new</span>' +
+        '<span class="uipick-panel-spacer"></span>' +
+        '<button type="button" class="uipick-cancel">Cancel</button>' +
+        '<button type="button" class="uipick-apply">Apply</button>' +
+      '</div>';
+    (document.body || document.documentElement).appendChild(p);
+    panelEl = p;
+    try {
+      var sw = p.querySelector("#__ui_pick_panel_switch__");
+      var ap = p.querySelector(".uipick-apply");
+      var cn = p.querySelector(".uipick-cancel");
+      if (sw) sw.addEventListener("click", onPanelToggle);
+      if (ap) ap.addEventListener("click", onPanelApply);
+      if (cn) cn.addEventListener("click", onPanelCancel);
+    } catch (e) {}
+    return p;
+  };
+  // populate the panel for a spec — summary, the old→new diff lines, switch enable/disable by kind
+  var fillPanel = function (spec) {
+    try {
+      var p = buildPanelShell();
+      var sum = p.querySelector(".uipick-panel-summary");
+      var diff = p.querySelector(".uipick-panel-diff");
+      var sw = p.querySelector("#__ui_pick_panel_switch__");
+      var ap = p.querySelector(".uipick-apply");
+      var cn = p.querySelector(".uipick-cancel");
+      if (sum) { sum.textContent = (spec && spec.summary) ? String(spec.summary) : "Preview"; sum.classList.remove("uipick-panel-err"); }
+      var lines = [];
+      if (spec && spec.diff && spec.diff.length) {
+        for (var i = 0; i < spec.diff.length; i++) {
+          var d = spec.diff[i] || {};
+          lines.push(String(d.prop) + ": " + String(d.from) + "  →  " + String(d.to));
+        }
+      } else if (spec && spec.kind === "text" && spec.textPreview) {
+        lines.push('text: "' + String(spec.textPreview.from) + '"  →  "' + String(spec.textPreview.to) + '"');
+      }
+      var isStructural = !!(spec && spec.kind === "structure");
+      if (diff) {
+        if (lines.length) { diff.textContent = lines.join("\n"); diff.hidden = false; }
+        else { diff.textContent = ""; diff.hidden = true; }
+      }
+      if (sw) {
+        if (isStructural) {                      // structure: no live overlay — diff only, switch disabled
+          sw.disabled = true; sw.setAttribute("aria-disabled", "true");
+          sw.setAttribute("title", "结构改动—以 diff 呈现");
+          sw.classList.remove("is-on"); sw.setAttribute("aria-checked", "false");
+        } else {
+          sw.disabled = false; sw.removeAttribute("aria-disabled"); sw.removeAttribute("title");
+          sw.classList.add("is-on"); sw.setAttribute("aria-checked", "true");
+        }
+      }
+      if (ap) { ap.disabled = false; ap.textContent = "Apply"; }
+      if (cn) { cn.disabled = false; }
+    } catch (e) {}
+  };
+  var setPanelApplying = function () {
+    try {
+      if (!panelEl) return;
+      var ap = panelEl.querySelector(".uipick-apply");
+      var cn = panelEl.querySelector(".uipick-cancel");
+      var sw = panelEl.querySelector("#__ui_pick_panel_switch__");
+      if (ap) { ap.disabled = true; ap.textContent = "applying…"; }
+      if (cn) cn.disabled = true;
+      if (sw) sw.disabled = true;
+    } catch (e) {}
+  };
+  var setPanelFail = function (msg) {
+    try {
+      if (!panelEl) return;
+      var ap = panelEl.querySelector(".uipick-apply");
+      var cn = panelEl.querySelector(".uipick-cancel");
+      var sw = panelEl.querySelector("#__ui_pick_panel_switch__");
+      var sum = panelEl.querySelector(".uipick-panel-summary");
+      if (sum) { sum.textContent = String(msg || "Apply failed — see report"); sum.classList.add("uipick-panel-err"); }
+      if (ap) { ap.disabled = true; ap.textContent = "Apply"; }   // nothing to apply now; retry re-issues a PREVIEW
+      if (cn) cn.disabled = false;                                 // Cancel still dismisses
+      if (sw) sw.disabled = true;
+    } catch (e) {}
+  };
+
+  // ---- the global preview API the runbook drives ----
+
+  // PREVIEW(spec) -> JSON status. Enter previewing; requires an active, connected selection.
+  window.__UI_PICK_PREVIEW__ = function (spec) {
+    try {
+      var selVisible = false;
+      try { selVisible = !!sel && sel.style.display !== "none"; } catch (e) {}
+      if (!selVisible || !lockedEl) return JSON.stringify({ ok: false, reason: "no-selection" });
+      if (!lockedEl.isConnected) return JSON.stringify({ ok: false, reason: "detached" });
+      if (!spec || typeof spec !== "object") return JSON.stringify({ ok: false, reason: "no-spec" });
+
+      // re-entry: tear down the prior overlay (restore its override) before mounting the new one
+      if (previewing) { try { leavePreviewing("restore"); } catch (e) {} }
+      window.__UI_PICK_DECISION__ = null;                 // verdict reset on (re)entry
+
+      previewSpec = spec;
+      previewSnapshot = null;
+      previewTextSnap = null;
+      previewShowingNew = true;
+      try { previewCssSnap = lockedEl.style.cssText; } catch (e) { previewCssSnap = null; } // exact restore basis
+
+      var kind = spec.kind || "style";
+      var applied = [];
+      var before = rectOf(lockedEl);
+
+      // style overlay (style + the style half of mixed)
+      if (spec.styles && (kind === "style" || kind === "mixed")) {
+        var props = [];
+        for (var pk in spec.styles) { if (spec.styles.hasOwnProperty(pk)) props.push(toKebab(pk)); }
+        previewSnapshot = snapshotInline(lockedEl, props);
+        applied = applyOverride(lockedEl, spec.styles);
+      }
+      // text swap (text kind only, element with no element children)
+      if (kind === "text" && spec.textPreview && spec.textPreview.to != null) {
+        previewTextSnap = applyTextSwap(lockedEl, spec.textPreview.to);
+      }
+
+      var after = rectOf(lockedEl);                        // forces reflow -> post-override geometry
+      var geomChanged = geomDiff(before, after);
+
+      previewing = true;
+      try { sel.classList.add("is-previewing"); } catch (e) {}
+      rePlaceSel();                                        // E8: reposition lock box after reflow
+      fillPanel(spec);                                     // build/refresh the verdict panel
+
+      var tag = lastTag || ((lockedEl.tagName || "node").toLowerCase());
+      try { setWidgetState("previewing", tag); } catch (e) {}
+
+      return JSON.stringify({ ok: true, kind: kind, applied: applied, geomChanged: geomChanged });
+    } catch (e) {
+      return JSON.stringify({ ok: false, reason: "error", message: String((e && e.message) || e) });
+    }
+  };
+
+  // TOGGLE(showNew?) -> bool. old<->new. Re-applies/undoes the override; repositions; never touches decision.
+  window.__UI_PICK_PREVIEW_TOGGLE__ = function (showNewArg) {
+    try {
+      if (!previewing) return false;
+      var wantNew = showNewArg !== false;
+      if (wantNew) { showNew(); previewShowingNew = true; }
+      else { showOld(); previewShowingNew = false; }
+      try {
+        if (panelEl) {
+          var sw = panelEl.querySelector("#__ui_pick_panel_switch__");
+          if (sw && !sw.disabled) {
+            if (wantNew) { sw.classList.add("is-on"); sw.setAttribute("aria-checked", "true"); }
+            else { sw.classList.remove("is-on"); sw.setAttribute("aria-checked", "false"); }
+          }
+        }
+      } catch (e) {}
+      try { if (widgetEl) { if (wantNew) widgetEl.classList.remove("wpv-old"); else widgetEl.classList.add("wpv-old"); } } catch (e) {}
+      rePlaceSel();
+      return wantNew;
+    } catch (e) { return false; }
+  };
+
+  // COMMIT() -> void. Apply aftermath (runbook calls after Edit+HMR land). Strip the inline override so
+  // source takes over (visual no-op), remove the panel, reset decision. Does NOT touch widget state.
+  window.__UI_PICK_PREVIEW_COMMIT__ = function () {
+    try {
+      leavePreviewing("commit");
+      removePanel();
+      window.__UI_PICK_DECISION__ = null;
+    } catch (e) {}
+  };
+
+  // FAIL(msg) -> void. Apply failure path. Restore override to original, brief red flash, panel shows the
+  // reason, decision=null, back to picked. NEVER calls PROCESSING(false) (that is the emerald success flash).
+  window.__UI_PICK_PREVIEW_FAIL__ = function (msg) {
+    try {
+      leavePreviewing("restore");          // undo override -> original
+      try { resetProcVisual(); } catch (e) {}  // clear the in-flight "applying" sweep (NOT the green done flash)
+      rePlaceSel();
+      window.__UI_PICK_DECISION__ = null;
+      flashError(msg);
+      setPanelFail(msg);
+      try { setWidgetState("picked", lastTag || "node"); } catch (e) {}
+    } catch (e) {}
+  };
+
+  // END() -> void. Hard exit from previewing without landing: restore override, remove panel, decision=null,
+  // back to picked. Used by Cancel, Esc-in-preview, and the re-arm/teardown edge unbinds.
+  window.__UI_PICK_PREVIEW_END__ = function () {
+    try {
+      if (previewing) { leavePreviewing("restore"); rePlaceSel(); }
+      removePanel();
+      window.__UI_PICK_DECISION__ = null;
+      try { resetProcVisual(); } catch (e) {}
+      try {
+        if (sel && sel.style.display !== "none" && lockedEl) {
+          setWidgetState("picked", lastTag || ((lockedEl.tagName || "node").toLowerCase()));
+        }
+      } catch (e) {}
+    } catch (e) {}
+  };
+
+  // ALIVE() -> bool. previewing AND the locked element is still connected (runbook E1 detach probe).
+  window.__UI_PICK_PREVIEW_ALIVE__ = function () {
+    try { return !!(previewing && lockedEl && lockedEl.isConnected); } catch (e) { return false; }
   };
 
   // ----------------------- bottom-docked status widget -----------------------
@@ -530,13 +929,61 @@
     "#ui-status-widget.is-processing .uisw-dot{background:#6366f1;animation:uisw-pulse-indigo 1.4s cubic-bezier(.4,0,.2,1) infinite}",
     "#ui-status-widget.is-done .uisw-dot{background:#34d399;animation:uisw-pulse 1.4s cubic-bezier(.4,0,.2,1) 1}",
     // reduced motion: no sweep/breath/dots/pulse — static indigo glow, literal ellipsis, instant done
-    "@media (prefers-reduced-motion:reduce){#ui-status-widget{animation:none}#ui-status-widget.is-armed .uisw-dot{animation:none;box-shadow:0 0 0 3px rgba(52,211,153,0.18),0 0 6px rgba(52,211,153,.55)}#__ui_pick_sel__.is-processing{animation:none;border:2px dashed #6366f1 !important;box-shadow:0 0 0 2px rgba(99,102,241,.30),0 2px 14px rgba(99,102,241,.40) !important}#__ui_pick_sweep__{display:none}#__ui_pick_sel_label__ .uipick-dot,#ui-status-widget .uipick-dot{animation:none;opacity:1}#ui-status-widget.is-processing .uisw-dot{animation:none;background:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.18),0 0 6px rgba(99,102,241,.6)}#__ui_pick_sel__.is-done{transition:none}#ui-status-widget.is-done .uisw-dot{animation:none}}"
+    "@media (prefers-reduced-motion:reduce){#ui-status-widget{animation:none}#ui-status-widget.is-armed .uisw-dot{animation:none;box-shadow:0 0 0 3px rgba(52,211,153,0.18),0 0 6px rgba(52,211,153,.55)}#__ui_pick_sel__.is-processing{animation:none;border:2px dashed #6366f1 !important;box-shadow:0 0 0 2px rgba(99,102,241,.30),0 2px 14px rgba(99,102,241,.40) !important}#__ui_pick_sweep__{display:none}#__ui_pick_sel_label__ .uipick-dot,#ui-status-widget .uipick-dot{animation:none;opacity:1}#ui-status-widget.is-processing .uisw-dot{animation:none;background:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.18),0 0 6px rgba(99,102,241,.6)}#__ui_pick_sel__.is-done{transition:none}#ui-status-widget.is-done .uisw-dot{animation:none}}",
+    // ---- previewing / verdict states (amber #f59e0b = preview, awaiting Apply/Cancel) ----
+    "#ui-status-widget.is-previewing .uisw-dot{background:#f59e0b;box-shadow:0 0 0 3px rgba(245,158,11,.18),0 0 7px rgba(245,158,11,.7)}",
+    "#ui-status-widget.is-previewing .uisw-switch{background:linear-gradient(180deg,#fbbf24,#f59e0b);box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 1px 3px rgba(245,158,11,.45)}",
+    "#ui-status-widget.is-previewing .uisw-switch:hover{background:linear-gradient(180deg,#fcbf3a,#fba40b)}",
+    "#ui-status-widget.is-previewing .uisw-knob{transform:translateX(14px)}",
+    "#ui-status-widget.is-previewing .uisw-tag{color:#fcd34d}",
+    // widget switch reflects old/new while previewing: .wpv-old slides the knob back + dims the track
+    "#ui-status-widget.is-previewing.wpv-old .uisw-knob{transform:translateX(0)}",
+    "#ui-status-widget.is-previewing.wpv-old .uisw-switch{background:rgba(255,255,255,0.12);box-shadow:inset 0 0 0 1px rgba(255,255,255,0.07),inset 0 1px 2px rgba(0,0,0,.25)}",
+    // brief red flash on apply failure
+    "#ui-status-widget.is-error{border-color:rgba(239,68,68,.6);box-shadow:0 0 0 1px rgba(239,68,68,.5),0 10px 30px rgba(0,0,0,.46)}",
+    "#ui-status-widget.is-error .uisw-dot{background:#ef4444;box-shadow:0 0 0 3px rgba(239,68,68,.20),0 0 7px rgba(239,68,68,.7)}",
+    // sel lock box while previewing: dashed amber edge (!important to beat the inline indigo border/shadow)
+    "#__ui_pick_sel__.is-previewing{border:2px dashed #f59e0b !important;box-shadow:0 0 0 2px rgba(245,158,11,.28),0 2px 12px rgba(245,158,11,.38) !important}",
+    // ---- compare / verdict panel ----
+    "@keyframes uipick-panel-in{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}",
+    "#__ui_pick_panel__{position:fixed;left:50%;bottom:64px;transform:translateX(-50%);z-index:2147483647;box-sizing:border-box;max-width:min(92vw,520px);display:flex;flex-direction:column;gap:10px;padding:12px 14px;border-radius:14px;background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,0) 42%),rgba(18,19,24,0.96);border:1px solid rgba(255,255,255,0.10);box-shadow:0 14px 40px rgba(0,0,0,0.50),0 2px 6px rgba(0,0,0,0.30),inset 0 1px 0 rgba(255,255,255,0.09);color:#fff;font:500 12.5px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;animation:uipick-panel-in 200ms cubic-bezier(.22,1,.36,1) both}",
+    "@supports ((-webkit-backdrop-filter:blur(1px)) or (backdrop-filter:blur(1px))){#__ui_pick_panel__{background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,0) 42%),rgba(20,21,27,0.70);-webkit-backdrop-filter:blur(22px) saturate(160%);backdrop-filter:blur(22px) saturate(160%)}}",
+    "#__ui_pick_panel__ *{box-sizing:border-box}",
+    "#__ui_pick_panel__ .uipick-panel-summary{color:rgba(255,255,255,0.92);font-weight:600;letter-spacing:.01em}",
+    "#__ui_pick_panel__ .uipick-panel-summary.uipick-panel-err{color:#fca5a5}",
+    "#__ui_pick_panel__ .uipick-panel-diff{margin:0;padding:8px 10px;max-height:160px;overflow:auto;border-radius:8px;background:rgba(0,0,0,0.30);border:1px solid rgba(255,255,255,0.07);color:#cbd5e1;font:500 11.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word}",
+    "#__ui_pick_panel__ .uipick-panel-diff[hidden]{display:none}",
+    "#__ui_pick_panel__ .uipick-panel-row{display:flex;align-items:center;gap:9px}",
+    "#__ui_pick_panel__ .uipick-panel-swlabel{color:rgba(255,255,255,0.55);font-size:11px;letter-spacing:.02em}",
+    "#__ui_pick_panel__ .uipick-panel-spacer{flex:1 1 auto}",
+    // panel switch — reuses the widget switch visual language, panel-scoped (widget rules are #ui-status-widget-scoped)
+    "#__ui_pick_panel__ .uisw-switch{position:relative;flex:0 0 auto;width:32px;height:18px;padding:0;margin:0;border:none;border-radius:9px;cursor:pointer;-webkit-appearance:none;appearance:none;background:rgba(255,255,255,0.12);box-shadow:inset 0 0 0 1px rgba(255,255,255,0.07),inset 0 1px 2px rgba(0,0,0,.25);transition:background 200ms cubic-bezier(.4,0,.2,1)}",
+    "#__ui_pick_panel__ .uisw-switch.is-on{background:linear-gradient(180deg,#5b52ec,#4f46e5);box-shadow:inset 0 1px 0 rgba(255,255,255,.18),0 1px 3px rgba(79,70,229,.45)}",
+    "#__ui_pick_panel__ .uisw-switch .uisw-knob{position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:linear-gradient(180deg,#fff,#eef0f4);box-shadow:0 1px 2px rgba(0,0,0,.45),0 0 0 .5px rgba(0,0,0,.06);transition:transform 200ms cubic-bezier(.4,0,.2,1)}",
+    "#__ui_pick_panel__ .uisw-switch.is-on .uisw-knob{transform:translateX(14px)}",
+    "#__ui_pick_panel__ .uisw-switch:focus-visible{outline:2px solid #818cf8;outline-offset:2px}",
+    "#__ui_pick_panel__ .uisw-switch:disabled{opacity:.45;cursor:not-allowed}",
+    // panel buttons: Apply (indigo) + Cancel (ghost)
+    "#__ui_pick_panel__ .uipick-apply,#__ui_pick_panel__ .uipick-cancel{flex:0 0 auto;height:28px;padding:0 14px;border-radius:8px;font:600 12px/1 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;cursor:pointer;-webkit-appearance:none;appearance:none;transition:background .15s ease,opacity .15s ease,border-color .15s ease}",
+    "#__ui_pick_panel__ .uipick-apply{border:none;color:#fff;background:linear-gradient(180deg,#5b52ec,#4f46e5);box-shadow:0 1px 3px rgba(79,70,229,.45),inset 0 1px 0 rgba(255,255,255,.18)}",
+    "#__ui_pick_panel__ .uipick-apply:hover{background:linear-gradient(180deg,#6760ef,#5852e8)}",
+    "#__ui_pick_panel__ .uipick-cancel{background:transparent;border:1px solid rgba(255,255,255,0.16);color:rgba(255,255,255,0.78)}",
+    "#__ui_pick_panel__ .uipick-cancel:hover{background:rgba(255,255,255,0.08);color:#fff}",
+    "#__ui_pick_panel__ .uipick-apply:disabled,#__ui_pick_panel__ .uipick-cancel:disabled{opacity:.5;cursor:not-allowed}",
+    "#__ui_pick_panel__ .uipick-apply:focus-visible,#__ui_pick_panel__ .uipick-cancel:focus-visible{outline:2px solid #818cf8;outline-offset:2px}",
+    // reduced motion (E7): no panel slide-in, static amber edge
+    "@media (prefers-reduced-motion:reduce){#__ui_pick_panel__{animation:none}#ui-status-widget.is-previewing .uisw-switch,#ui-status-widget.is-previewing .uisw-knob,#__ui_pick_panel__ .uisw-switch,#__ui_pick_panel__ .uisw-switch .uisw-knob{transition:none}#__ui_pick_sel__.is-previewing{box-shadow:0 0 0 2px rgba(245,158,11,.28) !important}}"
   ].join("\n");
 
   // toggle = arm vs pause picking (drives the SAME functions used elsewhere)
   function onToggleWidget() {
     try {
       if (!widgetEl) return;
+      // previewing: the toggle means "end the preview" (same semantics as Esc-in-preview) —
+      // NOT pause. Without this it falls through to the else branch and half-tears the state
+      // (override left on the element, panel still mounted, previewing still true, but the
+      // lock box hidden and the pill says "paused"). End cleanly and stop.
+      if (previewing) { try { window.__UI_PICK_PREVIEW_END__(); } catch (e) {} return; }
       if (widgetEl.classList.contains("is-paused")) {
         // OFF -> ON: re-arm (clears any pick, re-adds listeners, sets is-armed)
         if (typeof window.__UI_PICK_REARM__ === "function") window.__UI_PICK_REARM__();
@@ -576,6 +1023,9 @@
       } else if (state === "done") {
         if (label) label.innerHTML = '<span class="uisw-tag">&lt;' + ct + "&gt;</span> ✓ done";
         if (sw) sw.setAttribute("aria-checked", "true");
+      } else if (state === "previewing") {
+        if (label) label.innerHTML = '<span class="uisw-tag">&lt;' + ct + "&gt;</span> · preview";
+        if (sw) sw.setAttribute("aria-checked", previewShowingNew ? "true" : "false");
       } else if (state === "picked") {
         var t = ct;
         if (label) label.innerHTML = '<span class="uisw-tag">&lt;' + t + "&gt;</span> selected";
@@ -626,9 +1076,17 @@
   // trusted line — assemble() already prefers it over _debugSource. We still don't
   // activate the overlay; the project-instrumented case is handled by enrichment.
 
-  // Escape -> cancel + clean up
+  // Escape -> layered by state (E2):
+  //  - previewing: Esc ENDS the preview (restore + back to picked); does NOT exit /ui.
+  //  - picked/armed: Esc cancels the whole session + tears down.
   document.addEventListener("keydown", function onEsc(e) {
-    if (e.key === "Escape") { window.__UI_PICK__ = "cancelled"; teardown(); }
+    if (e.key !== "Escape") return;
+    if (previewing) {
+      try { window.__UI_PICK_PREVIEW_END__(); } catch (e2) {}
+      try { e.preventDefault(); e.stopImmediatePropagation(); } catch (e2) {}
+      return;
+    }
+    window.__UI_PICK__ = "cancelled"; teardown();
   }, true);
 
   window.__UI_PICK_STATUS__ = status;

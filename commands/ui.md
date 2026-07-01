@@ -391,34 +391,80 @@ edited the WRONG thing.** The single most important rule:
 3. **Do not let tooling clobber a live pick.** Avoid re-injecting / re-arming while a real
    selection is pending — re-arm sets `__UI_PICK__=null` and discards the pick.
 
-## Step 8 — Edit, then re-check — SHARED logic, ops swap per driver
+## Step 8 — Preview → verdict → land (or cancel) — SHARED logic, ops swap per driver
 
-**Before editing, ALWAYS echo the target** so a wrong selection is visible before the change
-lands — mandatory in BOTH one-shot and conversational mode:
-> `Editing <ABS>:<lineNumber> — <tag>/<componentName> ("<element.text>"). Applying: <instruction>`
+After a pick, do **NOT** Edit source directly. Compute a *spec*, render a non-destructive
+**preview** on the live element, let Stan **Apply/Cancel** in the docked panel, and only land
+the source edit on Apply. The verdict is read by polling `window.__UI_PICK_DECISION__`
+(latched: `null` | `"apply"` | `"cancel"`). New globals the capture script exposes:
+`__UI_PICK_PREVIEW__(spec)`, `__UI_PICK_DECISION__`, `__UI_PICK_PREVIEW_TOGGLE__(showNew)`,
+`__UI_PICK_PREVIEW_COMMIT__()`, `__UI_PICK_PREVIEW_FAIL__(msg)`, `__UI_PICK_PREVIEW_END__()`,
+`__UI_PICK_PREVIEW_ALIVE__()`.
 
-**Turn on the "processing" effect** right before editing (processing op):
+**8.0 — Re-read the live selection** (eval_readback op; EDITING DISCIPLINE) — never infer the
+target from chat. `null` → STOP ("click the element first"); `"cancelled"` → exited; a blob →
+that is the target.
+
+**8.1 — Build the spec** from the instruction + blob. `prop:value` are the *visual intent*; the
+preview applies them as `!important` inline overrides, so they must be what you'll also make the
+source render (preview-must-equal-land):
+```js
+spec = { kind:"style"|"text"|"structure"|"mixed",
+  styles:{ "padding":"24px", "background-color":"#10b981" },   // style/mixed; camelCase or kebab both OK
+  summary:"内边距 16→24px，主色改翠绿",                          // REQUIRED, human, shown in the panel
+  diff:[ {prop:"padding",from:"16px",to:"24px"} ],             // optional, display-only
+  textPreview:{from:"Sign in",to:"Log in"}|null,              // text kind only
+  note:null }
+```
+`from` is display-only — the script reverts against the live inline `cssText`, not against `from`.
+For `structure` (DOM add/remove/reorder) there is no live overlay — the panel shows a code diff
+only and the toggle is disabled; the Apply/Cancel gate is identical.
+
+**8.2 — Enter preview** (PREVIEW op). Returns `{ok,kind,applied,geomChanged}`; `ok:false` with
+`reason:"no-selection"|"detached"|"no-spec"` → re-pick, do NOT edit. Echo the target first:
+> `Previewing <ABS>:<lineNumber> — <tag>/<componentName> ("<text>"). Proposal: <summary>`
 ```bash
-# cmux:   $CMUX browser --surface "$S" eval --script 'window.__UI_PICK_PROCESSING__&&window.__UI_PICK_PROCESSING__(true)'
-# chrome: evaluate_script({function:"() => { window.__UI_PICK_PROCESSING__&&window.__UI_PICK_PROCESSING__(true); return true; }"})
+# cmux — escape+inline the spec JSON into the eval string:
+SPEC_JSON='{"kind":"style","styles":{"background-color":"#10b981"},"summary":"…"}'   # build with python/jq
+$CMUX browser --surface "$S" eval --script 'window.__UI_PICK_PREVIEW__ && window.__UI_PICK_PREVIEW__('"$SPEC_JSON"')'
+# chrome — pass the spec as a STRUCTURED arg (no string escaping):
+#   evaluate_script({ function:"(spec) => window.__UI_PICK_PREVIEW__(spec)", args:[spec] })
 python3 -c 'import json,time,os;f=os.path.expanduser("~/.claude/ui-selection.json");m=json.load(open(f)) if os.path.exists(f) else {};m.update(state="editing",ts=time.time());json.dump(m,open(f,"w"))' 2>/dev/null
 ```
-Then apply the instruction (or, if empty, ask Stan what to change now the component is
-identified) to the resolved file with the Edit tool. Keep the change scoped to the clicked
-component. Verify visually — the dev server hot-reloads:
-```bash
-# reload only if no HMR:  cmux: $CMUX browser --surface "$S" reload   |   chrome: navigate_page({type:"reload"})
-# processing(false) (done flash):
-#   cmux:   $CMUX browser --surface "$S" eval --script 'window.__UI_PICK_PROCESSING__&&window.__UI_PICK_PROCESSING__(false)'
-#   chrome: evaluate_script({function:"() => { window.__UI_PICK_PROCESSING__&&window.__UI_PICK_PROCESSING__(false); return true; }"})
-python3 -c 'import json,time,os;f=os.path.expanduser("~/.claude/ui-selection.json");m=json.load(open(f)) if os.path.exists(f) else {};m.update(state="selected",ts=time.time());json.dump(m,open(f,"w"))' 2>/dev/null
-# screenshot the result:  cmux: ... screenshot --out "$SCRATCH/after.png"  |  chrome: take_screenshot({filePath:".ui-pick/after.png"})
-```
-> chrome reload caveat: if you reload and did NOT arm `navigate_page` initScript, the capture
-> script is gone — reinject (Step 4) before the next pick.
 
-Report the file:line edited, the component name, what changed, and any console errors
-(cmux: `cmux browser <S> errors list`).
+**8.3 — Poll the verdict** every ~400ms (120s cap). `eval_readback` of `window.__UI_PICK_DECISION__`:
+- `null` → keep waiting.
+- `"cancel"` → Stan cancelled (panel Cancel / Esc-in-preview): the script already ran
+  `__UI_PICK_PREVIEW_END__` (override restored, panel gone, back to picked). **No source edit.**
+  Report "discarded — nothing changed"; the selection survives. Stop.
+- `"apply"` → go to 8.4.
+- each loop ALSO check liveness (E1): `eval_readback` of `window.__UI_PICK_PREVIEW_ALIVE__()` —
+  `false` (or `__UI_PICK_DECISION__===undefined`) means HMR/reload wiped the script or the element
+  detached → `__UI_PICK_PREVIEW_FAIL__("element reloaded")`, re-inject (Step 4), re-pick.
+- cmux readback: `eval --script 'JSON.stringify(window.__UI_PICK_DECISION__)'` (bare/quoted ladder;
+  `undefined`=wiped). chrome: `evaluate_script({function:"() => window.__UI_PICK_DECISION__"})` (typed).
+
+**8.4 — Apply (land it).** Exact order — `COMMIT` and `PROCESSING(false)` are SEPARATE calls:
+1. `__UI_PICK_PROCESSING__(true)` (processing op) — indigo "applying" sweep; the override stays on.
+2. Resolve file+line (Step 7) and **Edit** the source so it renders the previewed result (for
+   Tailwind/styled-components, pick tokens whose *computed* value equals `spec.styles` —
+   preview-must-equal-land). Keep the change scoped to the clicked component. Wait for HMR.
+   - On Edit/parse failure (E5): `__UI_PICK_PREVIEW_FAIL__("<reason>")` → restores the override, red
+     flash, panel shows the reason, back to picked. **Do NOT call `PROCESSING(false)`** (that is the
+     emerald *success* flash). Selection+blob are kept for a retry. Stop.
+3. On success: `__UI_PICK_PROCESSING__(false)` (emerald done flash), THEN `__UI_PICK_PREVIEW_COMMIT__()`
+   (strips the inline override so the edited source takes over — visual no-op; removes the panel).
+   ```bash
+   python3 -c 'import json,time,os;f=os.path.expanduser("~/.claude/ui-selection.json");m=json.load(open(f)) if os.path.exists(f) else {};m.update(state="selected",ts=time.time());json.dump(m,open(f,"w"))' 2>/dev/null
+   ```
+4. Screenshot the result (screenshot op: cmux `... screenshot --out "$SCRATCH/after.png"`; chrome
+   `take_screenshot({filePath:".ui-pick/after.png"})`). Report file:line, component, what changed,
+   and any console errors (cmux: `cmux browser <S> errors list`).
+
+> Notes: preview is **modal** — page clicks during preview are swallowed; only the panel / Esc /
+> widget decide. Re-injecting or re-arming kills any live preview first — never re-inject while a
+> verdict is pending. If the author uses `!important` and the landed source won't, set `spec.note`.
+> chrome reload caveat: a reload wipes the capture script — reinject (Step 4) before the next pick.
 
 ## Step 9 — Disarm — teardown op + marker cleanup
 
