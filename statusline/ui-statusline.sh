@@ -7,10 +7,15 @@
 # original output first; the banner is best-effort.
 
 ORIG="$HOME/.claude/statusline-command.sh"
-MARKER="$HOME/.claude/ui-selection.json"
 
 # Claude Code passes session context as JSON on stdin; capture so we can re-feed it.
 input="$(cat 2>/dev/null)"
+
+# Per-pane marker: key by this pane's session_id so a /ui selection in one cmux pane
+# never shows on another pane's statusline. Derivation MUST match ui-selection-watch.sh
+# and ui.md (ui-selection${SID:+-$SID}.json). Empty SID → legacy shared path.
+SID="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)"
+if [ -n "$SID" ]; then MARKER="$HOME/.claude/ui-selection-$SID.json"; else MARKER="$HOME/.claude/ui-selection.json"; fi
 
 # 1) original statusline, verbatim (never altered)
 if [ -x "$ORIG" ] || [ -f "$ORIG" ]; then
@@ -41,3 +46,7 @@ PY
 )"
   [ -n "$line" ] && printf '\n%s' "$line"
 fi
+
+# Never let a failed test (e.g. missing/stale marker) bubble up as a non-zero
+# exit — Claude Code hides the whole statusline when the command exits != 0.
+exit 0

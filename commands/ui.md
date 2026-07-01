@@ -246,9 +246,16 @@ expect a trusted line or the content-locate path. `reactGrabPresent:false` is fi
 in-page selection in real time (banner appears on pick, clears on deselect, updates on
 re-pick) — without it the marker only updates at poll checkpoints and lags behind clicks:
 ```bash
-touch ~/.claude/.ui-watch.stop 2>/dev/null; sleep 0.6; rm -f ~/.claude/.ui-watch.stop   # stop any prior watcher
-nohup bash "$ASSETS/ui-selection-watch.sh" "$S" >/dev/null 2>&1 &                        # background bridge
+SID="${CLAUDE_CODE_SESSION_ID:-}"                                                        # per-pane key (see below)
+touch ~/.claude/.ui-watch${SID:+-$SID}.stop 2>/dev/null; sleep 0.6; rm -f ~/.claude/.ui-watch${SID:+-$SID}.stop   # stop THIS pane's prior watcher
+nohup bash "$ASSETS/ui-selection-watch.sh" "$S" "$SID" >/dev/null 2>&1 &                 # background bridge (per-pane marker)
 ```
+> **Per-pane isolation.** The marker file is keyed by `session_id`
+> (`ui-selection${SID:+-$SID}.json`) so a selection in ONE cmux pane never shows on
+> another pane's statusline. `ui-selection-watch.sh`, `ui-statusline.sh`, and every
+> marker write below use the IDENTICAL derivation. Pass `$CLAUDE_CODE_SESSION_ID` as
+> the watcher's 2nd arg; the `.ui-watch*.stop/.pid` files are keyed the same way so
+> concurrent /ui panes don't kill each other's watchers.
 (chrome can't run this — `__UI_PICK__` is read via an MCP tool, not bash — so on chrome the
 marker is written at the Step 6 / Step 8 checkpoints only.)
 
@@ -320,7 +327,7 @@ Capture a screenshot for visual context via the **screenshot** op (`box` locates
 
 **Write the terminal-side selection marker** so the statusline shows a block is selected:
 ```bash
-python3 -c 'import json,time,os;p=json.load(open(os.environ["SCRATCH"]+"/last-pick.json"));p=json.loads(p) if isinstance(p,str) else p;e=p.get("element") or {};json.dump({"state":"selected","tag":e.get("tag","?"),"text":(e.get("text") or "")[:24],"ts":time.time()},open(os.path.expanduser("~/.claude/ui-selection.json"),"w"))' # export SCRATCH first
+python3 -c 'import json,time,os;sid=os.environ.get("CLAUDE_CODE_SESSION_ID","");mk=os.path.expanduser("~/.claude/ui-selection"+("-"+sid if sid else "")+".json");p=json.load(open(os.environ["SCRATCH"]+"/last-pick.json"));p=json.loads(p) if isinstance(p,str) else p;e=p.get("element") or {};json.dump({"state":"selected","tag":e.get("tag","?"),"text":(e.get("text") or "")[:24],"ts":time.time()},open(mk,"w"))' # export SCRATCH first; marker keyed by CLAUDE_CODE_SESSION_ID (per-pane)
 ```
 
 ## Step 7 — Resolve the file (with fallback ladder) — SHARED, driver-agnostic
@@ -429,7 +436,7 @@ SPEC_JSON='{"kind":"style","styles":{"background-color":"#10b981"},"summary":"�
 $CMUX browser --surface "$S" eval --script 'window.__UI_PICK_PREVIEW__ && window.__UI_PICK_PREVIEW__('"$SPEC_JSON"')'
 # chrome — pass the spec as a STRUCTURED arg (no string escaping):
 #   evaluate_script({ function:"(spec) => window.__UI_PICK_PREVIEW__(spec)", args:[spec] })
-python3 -c 'import json,time,os;f=os.path.expanduser("~/.claude/ui-selection.json");m=json.load(open(f)) if os.path.exists(f) else {};m.update(state="editing",ts=time.time());json.dump(m,open(f,"w"))' 2>/dev/null
+python3 -c 'import json,time,os;sid=os.environ.get("CLAUDE_CODE_SESSION_ID","");f=os.path.expanduser("~/.claude/ui-selection"+("-"+sid if sid else "")+".json");m=json.load(open(f)) if os.path.exists(f) else {};m.update(state="editing",ts=time.time());json.dump(m,open(f,"w"))' 2>/dev/null
 ```
 
 **8.3 — Poll the verdict** every ~400ms (120s cap). `eval_readback` of `window.__UI_PICK_DECISION__`:
@@ -455,7 +462,7 @@ python3 -c 'import json,time,os;f=os.path.expanduser("~/.claude/ui-selection.jso
 3. On success: `__UI_PICK_PROCESSING__(false)` (emerald done flash), THEN `__UI_PICK_PREVIEW_COMMIT__()`
    (strips the inline override so the edited source takes over — visual no-op; removes the panel).
    ```bash
-   python3 -c 'import json,time,os;f=os.path.expanduser("~/.claude/ui-selection.json");m=json.load(open(f)) if os.path.exists(f) else {};m.update(state="selected",ts=time.time());json.dump(m,open(f,"w"))' 2>/dev/null
+   python3 -c 'import json,time,os;sid=os.environ.get("CLAUDE_CODE_SESSION_ID","");f=os.path.expanduser("~/.claude/ui-selection"+("-"+sid if sid else "")+".json");m=json.load(open(f)) if os.path.exists(f) else {};m.update(state="selected",ts=time.time());json.dump(m,open(f,"w"))' 2>/dev/null
    ```
 4. Screenshot the result (screenshot op: cmux `... screenshot --out "$SCRATCH/after.png"`; chrome
    `take_screenshot({filePath:".ui-pick/after.png"})`). Report file:line, component, what changed,
@@ -472,8 +479,9 @@ Tear down the capture script's overlay + listeners (teardown op):
 ```bash
 # cmux:   $CMUX browser --surface "$S" eval --script 'window.__UI_PICK_TEARDOWN__&&window.__UI_PICK_TEARDOWN__()'
 # chrome: evaluate_script({function:"() => { window.__UI_PICK_TEARDOWN__&&window.__UI_PICK_TEARDOWN__(); return true; }"})
-touch ~/.claude/.ui-watch.stop                # stop the live selection watcher (cmux)
-rm -f ~/.claude/ui-selection.json             # clear the statusline banner
+SID="${CLAUDE_CODE_SESSION_ID:-}"
+touch ~/.claude/.ui-watch${SID:+-$SID}.stop   # stop THIS pane's live selection watcher (cmux)
+rm -f ~/.claude/ui-selection${SID:+-$SID}.json  # clear THIS pane's statusline banner (per-pane key)
 rm -rf "$SCRATCH"                             # clean runtime artifacts
 [ "$DRIVER" = chrome ] && rm -rf "$PROJECT_ROOT/.ui-pick"   # chrome screenshot artifacts (S3)
 ```

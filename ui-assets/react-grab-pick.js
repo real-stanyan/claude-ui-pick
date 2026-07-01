@@ -344,6 +344,7 @@
   // FULL teardown (Esc / Step 9 disarm / re-arm): remove listeners AND hide BOTH boxes
   var teardown = function () {
     stopListening();
+    try { window.removeEventListener("scroll", onTrackReflow, true); window.removeEventListener("resize", onTrackReflow); } catch (e) {}
     try { if (previewing) leavePreviewing("restore"); } catch (e) {}  // restore any live preview override
     try { removePanel(); } catch (e) {}                                // drop the verdict panel
     window.__UI_PICK_DECISION__ = null;                                // reset latched verdict on hard exit
@@ -525,6 +526,23 @@
   var rePlaceSel = function () {
     try { if (lockedEl && lockedEl.isConnected) raf(function () { try { place(sel, lockedEl); } catch (e) {} }); } catch (e) {}
   };
+
+  // BUGFIX: the lock box is position:fixed placed via getBoundingClientRect, so on
+  // scroll/resize it stays glued to the VIEWPORT while the element scrolls away. Track
+  // scroll (capture:true → also nested scroll containers) + resize and re-place it so
+  // it stays glued to the ELEMENT. rAF-throttled; no-op unless a selection is visible.
+  var trackRaf = 0;
+  var onTrackReflow = function () {
+    if (trackRaf) return;
+    trackRaf = raf(function () {
+      trackRaf = 0;
+      try { if (lockedEl && lockedEl.isConnected && sel && sel.style.display !== "none") place(sel, lockedEl); } catch (e) {}
+    });
+  };
+  try {
+    window.addEventListener("scroll", onTrackReflow, true);
+    window.addEventListener("resize", onTrackReflow);
+  } catch (e) {}
 
   // snapshot current inline values (value + priority) for the props we're about to override
   var snapshotInline = function (el, props) {

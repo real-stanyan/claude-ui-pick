@@ -13,9 +13,14 @@
 set -u
 CMUX=/Applications/cmux.app/Contents/Resources/bin/cmux
 S="${1:?surface ref required}"
-MARKER="$HOME/.claude/ui-selection.json"
-STOP="$HOME/.claude/.ui-watch.stop"
-PIDF="$HOME/.claude/.ui-watch.pid"
+# SID = the calling Claude Code session_id → per-pane marker so a selection in ONE
+# cmux pane never bleeds into another pane's statusline. Empty SID falls back to the
+# legacy shared path (must match ui-statusline.sh's identical derivation).
+SID="${2:-}"
+MARKER="$HOME/.claude/ui-selection${SID:+-$SID}.json"
+STOP="$HOME/.claude/.ui-watch${SID:+-$SID}.stop"
+PIDF="$HOME/.claude/.ui-watch${SID:+-$SID}.pid"
+export UI_MARKER="$MARKER"
 rm -f "$STOP"; echo $$ > "$PIDF"
 # safety: never run longer than ~30min (3600 * 0.5s) even if the stop file is lost
 i=0
@@ -32,7 +37,7 @@ try:
     p=json.loads(sys.stdin.read())
     if isinstance(p,str): p=json.loads(p)
     e=p.get("element") or {}
-    f=os.path.expanduser("~/.claude/ui-selection.json")
+    f=os.environ.get("UI_MARKER") or os.path.expanduser("~/.claude/ui-selection.json")
     prev={}
     try: prev=json.load(open(f))
     except Exception: pass
